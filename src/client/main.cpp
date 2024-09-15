@@ -24,6 +24,11 @@ using json = nlohmann::json;
 #include "user.hpp"
 #include "group.hpp"
 
+//用于读写线程间的通信的信号量
+sem_t rwsem;
+//记录登录状态标识
+atomic_bool is_loginSuccess{false};
+
 CUser currUser; //记录当前系统登录的用户信息
 vector<CUser> vcurrUserFriendList; //记录当前登录用户的好友列表信息
 vector<CGroup> vcurrUserGroupList; //记录当前登录用户的群组列表信息
@@ -33,9 +38,13 @@ int conntodst(const char* ip, const int port);
 
 //login业务 (用户按照提示输入账号即id和密码进行登录)
 bool loginService(const int clientsock);
+//处理登录响应的业务逻辑
+bool doLoginResponse(json& responsejs);
 
 //register业务 (用户输入用户名和密码进行注册，服务端返还生成的id)
 void registService(const int clientsock);
+//处理注册响应的业务逻辑
+void doRegistResponse(json& responsejs);
 
 //quit业务 关闭sock，退出程序
 void quitService(int& clientsock);
@@ -112,6 +121,13 @@ int main(int argc, char* argv[])
     exit(-1);
   }
 
+  //连接服务器后，初始化读写线程通用的信号量
+  sem_init(&rwsem, 0, 0);
+
+  //连接服务器后，启动接收子线程，负责接收服务端的响应
+  std::thread readTask(readTaskHandler, clientsock); //pthread_create
+  readTask.detach(); //线程分离 pthread_detach
+
   //main线程用于接收用户输入，并发送消息给服务端。
   while (true) {
     //显示首页面菜单 登录、注册、退出
@@ -122,21 +138,35 @@ int main(int argc, char* argv[])
     cout << "==================================" << endl;
     cout << "please input your choice:";
     int choice = 0;
-    cin >> choice; cin.get(); //读掉缓冲区残留的回车
+
+    /* 下面的接收用户输入，只能接收数字，若用户输入别的内容，会造成死循环 */
+    // cin >> choice; cin.get(); //读掉缓冲区残留的回车
+
+    /* 采用下面的优化方案接收用户输入 */
+    // 清除之前的错误状态
+    if (std::cin.fail()) {
+      std::cin.clear();
+      std::cin.ignore(std::numeric_limits<std::streamsize>::max(), '\n'); // 忽略到下一个换行符
+    }
+    // 接收用户输入
+    std::cin >> choice;                                                 // 读取数字
+    std::cin.ignore(std::numeric_limits<std::streamsize>::max(), '\n'); // 读掉缓冲区残留的回车和其他字符
+    // 检查输入流的状态
+    if (std::cin.fail()) {
+      std::cerr << "Invalid input! Please enter a valid number." << std::endl;
+      continue; // 继续下次循环
+    }
 
     //根据用户不同的选择，作出不同的业务处理。
     switch (choice) {
     case 1: {
       //login业务 (用户按照提示输入账号即id和密码进行登录)
+      is_loginSuccess = false; //初始置为false
       if (loginService(clientsock) == false) break;
 
-      //登录成功，创建子线程负责随时读取消息(随时接收服务端传来的数据)，该线程只启动一次
-      static int readthreadnumber = 0;
-      if (readthreadnumber == 0) {
-        std::thread readTask(readTaskHandler, clientsock);
-        readTask.detach(); //线程分离
-        readthreadnumber++; //自加之后，不再为0，即不会再次创建此线程
-      }
+      //等待子线程接收响应后的通知 判断登录状态，登录失败则重新回到首页面
+      sem_wait(&rwsem);
+      if (is_loginSuccess == false) break;
 
       //登录成功，进入聊天主菜单页面
       isMainMenuRunning = true;
@@ -147,11 +177,19 @@ int main(int argc, char* argv[])
     case 2: {
       //regist业务 (用户输入用户名和密码进行注册，服务端返还生成的id)
       registService(clientsock);
+
+      //等待子线程接收响应后的通知，注册结束后重新回到首页面
+      sem_wait(&rwsem);
+
       break;
     }
     case 3: {
-      //quit业务 关闭sock，退出程序
+      //quit业务 关闭sock
       quitService(clientsock);
+      //销毁信号量
+      sem_destroy(&rwsem);
+      //退出程序
+      exit(EXIT_SUCCESS);
       break;
     }
     default: {
@@ -214,24 +252,19 @@ bool loginService(const int clientsock)
     cerr << "clientsock is disconnected." << endl;
     return false;
   }
-  //发送成功，接收服务端传来的响应
-  char recvbuffer[1024]{};
-  retlen = recv(clientsock, recvbuffer, sizeof(recvbuffer), 0);
-  if (retlen == -1) {
-    cerr << "recv login response error." << endl;
-    return false;
-  }
-  else if (retlen == 0) {
-    cerr << "clientsock is disconnected." << endl;
-    return false;
-  }
-  //将响应数据反序列化为json对象，解析响应数据
-  json responsejs = json::parse(recvbuffer);
+    
+  return true;
+}
+//处理登录响应的业务逻辑
+bool doLoginResponse(json& responsejs)
+{
+  //解析响应数据，返回登录状态
   if (responsejs["errno"].get<int>() != 0) {
     //登录失败
     cerr << responsejs["errmsg"].get<string>() << endl;
     return false;
   }
+
   //登录成功，记录存储一些信息，以后若需要可以直接使用
 
   //记录当前用户的信息id和name
@@ -344,28 +377,18 @@ void registService(const int clientsock)
     cerr << "clientsock is disconnected." << endl;
     return;
   }
-
-  //发送成功，接收服务端传来的响应
-  char recvbuffer[1024]{};
-  retlen = recv(clientsock, recvbuffer, sizeof(recvbuffer), 0);
-  if (retlen == -1) {
-    cerr << "recv register response error." << endl;
-    return;
-  }
-  else if (retlen == 0) {
-    cerr << "clientsock is disconnected." << endl;
-    return;
-  }
-
-  //将响应数据反序列化为json对象，解析响应，显示对应信息
-  json responsejs = json::parse(recvbuffer);
+}
+//处理注册响应的业务逻辑
+void doRegistResponse(json& responsejs)
+{
+  //解析响应，显示对应信息
   if (responsejs["errno"].get<int>() != 0) {
     //注册失败
-    cerr << name << " is already exist, register error!" << endl;
+    cerr << "user is already exist, register error!" << endl;
     return;
   }
   //注册成功，显示生成的id
-  cout << name << " register success, userid is " << responsejs["id"]
+  cout << "user register success, userid is " << responsejs["id"]
     << ", don't forget it!" << endl;
 }
 
@@ -373,7 +396,6 @@ void registService(const int clientsock)
 void quitService(int& clientsock)
 {
   close(clientsock); clientsock = -1;
-  exit(0);
 }
 
 //显示当前登录成功用户的基本信息
@@ -443,6 +465,23 @@ void readTaskHandler(const int clientsock)
       cout << "群消息[" << js["groupid"].get<int>() << "]:" << js["time"].get<string>()
         << " [" << js["id"].get<int>() << "]" << js["name"].get<string>()
         << " said: " << js["msg"].get<string>() << endl;
+      continue;
+    }
+    //登录业务响应
+    if (msgtype == LOGIN_MSG_ACK) {
+      //处理登录响应的业务逻辑 登录成功与否，都设置登录标识
+      if (doLoginResponse(js)) is_loginSuccess = true;
+      else is_loginSuccess = false;
+
+      sem_post(&rwsem); //通知登录业务继续进行
+      continue;
+    }
+    //注册业务响应
+    if (msgtype == REGIST_MSG_ACK) {
+      //处理注册响应的业务逻辑
+      doRegistResponse(js);
+
+      sem_post(&rwsem); //通知注册业务继续进行
       continue;
     }
   }
